@@ -1,0 +1,410 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ==========================================
+// 1. ENUMS (PADRONIZAÇÃO DE REGRAS DE NEGÓCIO)
+// ==========================================
+
+enum RoleName {
+  ADMINISTRADOR
+  GESTOR_ESTOQUE
+  ALMOXARIFE
+  SOLICITANTE
+  AUDITOR
+}
+
+enum ProductClassification {
+  CRITICO
+  ALTO
+  MEDIO
+  BAIXO
+}
+
+enum LotStatus {
+  ATIVO
+  BLOQUEADO
+  VENCIDO
+  RECOLHIDO
+}
+
+enum StockStatus {
+  DISPONIVEL
+  RESERVADO
+  BLOQUEADO
+  EM_TRANSITO
+}
+
+enum RequestStatus {
+  RASCUNHO
+  SOLICITADA
+  EM_ANALISE
+  APROVADA
+  PARCIALMENTE_ATENDIDA
+  SEPARACAO
+  ATENDIDA
+  RECUSADA
+  CANCELADA
+}
+
+enum MovementType {
+  ENTRADA_COMPRA
+  ENTRADA_DOACAO
+  SAIDA_ATENDIMENTO
+  TRANSFERENCIA_SAIDA
+  TRANSFERENCIA_ENTRADA
+  DEVOLUCAO_CLINICA
+  AJUSTE_INVENTARIO
+  DESCARTE_AVARIA
+  ESTORNO_CORRECAO
+}
+
+enum LossReason {
+  NENHUM
+  VENCIMENTO
+  AVARIA
+  CONTAMINACAO
+  ARMAZENAMENTO_INADEQUADO
+  QUEBRA
+  PERDA
+  RECOLHIMENTO
+  MATERIAL_NAO_UTILIZADO
+  INCORRETO
+}
+
+enum AuditEventType {
+  LOGIN
+  LOGOUT
+  CRIACAO
+  ALTERACAO
+  EXCLUSAO
+  APROVACAO
+  CANCELAMENTO
+  ESTORNO
+}
+
+// ==========================================
+// 2. CONTROLO DE ACESSO E UTILIZADORES
+// ==========================================
+
+model Role {
+  id          String   @id @default(uuid())
+  name        RoleName @unique
+  description String?
+  isSystem    Boolean  @default(false)
+  users       User[]
+
+  @@map("roles")
+}
+
+model User {
+  id             String    @id @default(uuid())
+  name           String
+  email          String    @unique
+  passwordHash   String
+  cpf            String    @unique
+  registration   String?   // CRM / COREN / MATRÍCULA
+  active         Boolean   @default(true)
+  
+  roleId         String
+  role           Role      @relation(fields: [roleId], references: [id])
+
+  requestsMade     StockRequest[]  @relation("Requester")
+  requestsApproved StockRequest[]  @relation("Approver")
+  movementsMade    StockMovement[] @relation("MovementUser")
+  auditLogs        AuditLog[]
+
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@map("users")
+}
+
+// ==========================================
+// 3. ESTRUTURA FÍSICA E LOGÍSTICA
+// ==========================================
+
+model Hospital {
+  id        String   @id @default(uuid())
+  name      String
+  code      String   @unique
+  cnpj      String   @unique
+  units     Unit[]
+
+  @@map("hospitals")
+}
+
+model Unit {
+  id         String      @id @default(uuid())
+  hospitalId String
+  hospital   Hospital    @relation(fields: [hospitalId], references: [id])
+  name       String
+  code       String
+  warehouses Warehouse[]
+
+  @@unique([hospitalId, code])
+  @@map("units")
+}
+
+model Warehouse {
+  id           String             @id @default(uuid())
+  unitId       String
+  unit         Unit               @relation(fields: [unitId], references: [id])
+  name         String
+  code         String             @unique
+  isSatellite  Boolean            @default(false)
+  locations    StorageLocation[]
+  balances     StockBalance[]
+
+  movementsOut StockMovement[]    @relation("SourceWarehouse")
+  movementsIn  StockMovement[]    @relation("DestWarehouse")
+  requests     StockRequest[]     @relation("TargetWarehouse")
+
+  @@map("warehouses")
+}
+
+// Mapeamento físico exigido (Corredor, Prateleira, etc.)
+model StorageLocation {
+  id          String         @id @default(uuid())
+  warehouseId String
+  warehouse   Warehouse      @relation(fields: [warehouseId], references: [id])
+  code        String         // ex: COR-A-PRAT-02
+  corridor    String?
+  shelf       String?
+  rack        String?
+  bin         String?
+  balances    StockBalance[]
+
+  @@unique([warehouseId, code])
+  @@map("storage_locations")
+}
+
+// ==========================================
+// 4. CATÁLOGO DE PRODUTOS
+// ==========================================
+
+model Category {
+  id            String        @id @default(uuid())
+  name          String
+  code          String        @unique
+  subcategories Subcategory[]
+
+  @@map("categories")
+}
+
+model Subcategory {
+  id         String    @id @default(uuid())
+  categoryId String
+  category   Category  @relation(fields: [categoryId], references: [id])
+  name       String
+  code       String    @unique
+  products   Product[]
+
+  @@map("subcategories")
+}
+
+model Product {
+  id               String                @id @default(uuid())
+  internalCode     String                @unique
+  barcode          String?               @unique
+  name             String
+  commercialName   String?
+  activeIngredient String?
+  
+  subcategoryId    String
+  subcategory      Subcategory           @relation(fields: [subcategoryId], references: [id])
+  
+  unitOfMeasure    String
+  classification   ProductClassification @default(BAIXO) // Curva ABC / Criticidade
+  
+  requiresLot      Boolean               @default(true)
+  requiresValidity Boolean               @default(true)
+  
+  // Regras de Reposição
+  minStock         Float                 @default(0)
+  maxStock         Float                 @default(0)
+  safetyStock      Float                 @default(0)
+  reorderPoint     Float                 @default(0)
+
+  lots             ProductLot[]
+  balances         StockBalance[]
+  requestItems     StockRequestItem[]
+
+  @@map("products")
+}
+
+// ==========================================
+// 5. LOTES, ESTOQUE E FORNECEDORES
+// ==========================================
+
+model Supplier {
+  id            String       @id @default(uuid())
+  corporateName String
+  tradeName     String
+  cnpj          String       @unique
+  email         String?
+  phone         String?
+  lots          ProductLot[]
+
+  @@map("suppliers")
+}
+
+model ProductLot {
+  id             String         @id @default(uuid())
+  productId      String
+  product        Product        @relation(fields: [productId], references: [id])
+  supplierId     String?
+  supplier       Supplier?      @relation(fields: [supplierId], references: [id])
+  
+  lotNumber      String
+  manufactureDate DateTime?
+  expirationDate DateTime?
+  status         LotStatus      @default(ATIVO)
+  
+  unitCost       Float          @default(0)
+  initialQty     Float
+
+  balances       StockBalance[]
+  movements      StockMovement[]
+
+  @@unique([productId, lotNumber])
+  @@map("product_lots")
+}
+
+model StockBalance {
+  id                String           @id @default(uuid())
+  warehouseId       String
+  warehouse         Warehouse        @relation(fields: [warehouseId], references: [id])
+  locationId        String?
+  location          StorageLocation? @relation(fields: [locationId], references: [id])
+  
+  productId         String
+  product           Product          @relation(fields: [productId], references: [id])
+  productLotId      String?
+  lot               ProductLot?      @relation(fields: [productLotId], references: [id])
+  
+  status            StockStatus      @default(DISPONIVEL)
+  
+  physicalQty       Float            @default(0)
+  availableQty      Float            @default(0)
+  reservedQty       Float            @default(0)
+  transitQty        Float            @default(0)
+  blockedQty        Float            @default(0)
+  
+  averageCost       Float            @default(0)
+
+  @@unique([warehouseId, productId, productLotId, locationId])
+  @@map("stock_balances")
+}
+
+// ==========================================
+// 6. SOLICITAÇÕES CLÍNICAS E DE SETOR
+// ==========================================
+
+model StockRequest {
+  id               String             @id @default(uuid())
+  requestNumber    String             @unique @default(cuid())
+  status           RequestStatus      @default(RASCUNHO)
+  
+  requesterId      String
+  requester        User               @relation("Requester", fields: [requesterId], references: [id])
+  approverId       String?
+  approver         User?              @relation("Approver", fields: [approverId], references: [id])
+  
+  targetWarehouseId String
+  targetWarehouse   Warehouse         @relation("TargetWarehouse", fields: [targetWarehouseId], references: [id])
+  
+  // Destinação Clínica
+  bedNumber        String?
+  patientName      String?
+  patientCpf       String?
+  
+  justification    String?            @db.Text
+  
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+
+  items            StockRequestItem[]
+  movements        StockMovement[]
+
+  @@map("stock_requests")
+}
+
+model StockRequestItem {
+  id             String       @id @default(uuid())
+  requestId      String
+  request        StockRequest @relation(fields: [requestId], references: [id])
+  
+  productId      String
+  product        Product      @relation(fields: [productId], references: [id])
+  
+  requestedQty   Float
+  approvedQty    Float?
+  deliveredQty   Float        @default(0)
+  returnedQty    Float        @default(0)
+  
+  substitution   Boolean      @default(false)
+  
+  @@map("stock_request_items")
+}
+
+// ==========================================
+// 7. RASTRABILIDADE E LEDGER (IMUTÁVEL)
+// ==========================================
+
+model StockMovement {
+  id                String       @id @default(uuid())
+  type              MovementType
+  reason            LossReason   @default(NENHUM) // Para avarias, descartes e devoluções
+  
+  productId         String
+  productLotId      String?
+  lot               ProductLot?  @relation(fields: [productLotId], references: [id])
+  
+  quantity          Float
+  unitCost          Float        @default(0)
+  totalCost         Float        @default(0)
+  
+  sourceWarehouseId String?
+  sourceWarehouse   Warehouse?   @relation("SourceWarehouse", fields: [sourceWarehouseId], references: [id])
+  destWarehouseId   String?
+  destWarehouse     Warehouse?   @relation("DestWarehouse", fields: [destWarehouseId], references: [id])
+  
+  requestId         String?
+  request           StockRequest? @relation(fields: [requestId], references: [id])
+  
+  userId            String
+  user              User         @relation("MovementUser", fields: [userId], references: [id])
+  
+  documentRef       String?      // NFe, Ticket, etc.
+  observations      String?      @db.Text
+  
+  createdAt         DateTime     @default(now()) // Data imutável do registo
+
+  @@map("stock_movements")
+}
+
+model AuditLog {
+  id           String         @id @default(uuid())
+  eventType    AuditEventType
+  tableName    String         // ex: "Product", "User", "StockMovement"
+  recordId     String
+  
+  userId       String
+  user         User           @relation(fields: [userId], references: [id])
+  
+  oldData      Json?          // Snapshot do estado anterior
+  newData      Json?          // Snapshot do novo estado
+  
+  ipAddress    String?
+  createdAt    DateTime       @default(now())
+
+  @@map("audit_logs")
+}
